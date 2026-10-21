@@ -1,0 +1,37 @@
+{
+  "packageId": "com.quietpulse.app",
+  "host": "quietpulse.app",
+  "name": "QuietPulse",
+  "launcherName": "QuietPulse",
+  "display": "standalone",
+  "themeColor": "#0B0F17",
+  "navigationColor": "#0B0F17",
+  "navigationColorDark": "#0B0F17",
+  "navigationDividerColor": "#1E293B",
+  "navigationDividerColorDark": "#1E293B",
+  "backgroundColor": "#0B0F17",
+  "enableNotifications": true,
+  "startUrl": "/",
+  "iconUrl": "https://quietpulse.app/pwa-512x512.png",
+  "maskableIconUrl": "https://quietpulse.app/pwa-maskable-512x512.png",
+  "appVersionName": "1.0.0",
+  "appVersionCode": 1,
+  "shortcuts": [
+    {
+      "name": "Start 25m DND Focus",
+      "shortName": "25m Focus",
+      "url": "/?tab=focus",
+      "chosenIconUrl": "https://quietpulse.app/pwa-192x192.png"
+    },
+    {
+      "name": "3D Zen Sanctuary",
+      "shortName": "3D Zen",
+      "url": "/?tab=sanctuary",
+      "chosenIconUrl": "https://quietpulse.app/pwa-192x192.png"
+    }
+  ],
+  "generatorApp": "bubblewrap-cli",
+  "fallbackType": "customtabs",
+  "enableSiteSettingsShortcut": true,
+  "isChromeOSOnly": false
+}

@@ -1,0 +1,8 @@
+{
+  "name": "@quietpulse/shared",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "Shared plain-JS data models, streak and stats calculators, offline LWW sync engine, and REST API client for QuietPulse."
+}

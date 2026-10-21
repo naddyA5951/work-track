@@ -1,0 +1,6 @@
+{
+  "name": "GitHub Hub & Repository Explorer",
+  "description": "Explore GitHub profiles, repositories, commit history, and activity with public API search and token-based access.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

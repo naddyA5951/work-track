@@ -1,0 +1,30 @@
+{
+  "expo": {
+    "name": "QuietPulse",
+    "slug": "quietpulse",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "quietpulse",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.quietpulse.app",
+      "infoPlist": {
+        "LSApplicationQueriesSchemes": ["shortcuts"],
+        "UIBackgroundModes": ["fetch", "remote-notification"]
+      }
+    },
+    "android": {
+      "package": "com.quietpulse.app",
+      "permissions": [
+        "android.permission.ACCESS_NOTIFICATION_POLICY",
+        "android.permission.VIBRATE",
+        "android.permission.WAKE_LOCK"
+      ]
+    },
+    "plugins": [
+      "expo-dev-client",
+      "expo-notifications"
+    ]
+  }
+}
