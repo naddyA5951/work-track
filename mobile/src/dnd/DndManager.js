@@ -1,5 +1,7 @@
 /**
- * Mobile Cross-Platform DND Manager (Android Native Module + iOS Shortcuts/Focus Filter + Fullscreen Fallback)
+ * Mobile Cross-Platform DND & Notification Blocker Manager
+ * (Android Native NotificationManager.setInterruptionFilter + iOS Shortcuts/Focus Filter +
+ *  In-App Notification Quarantine Queue & Fullscreen Lockout Fallback)
  */
 
 import { NativeModules, Platform, Linking } from 'react-native';
@@ -10,11 +12,68 @@ export class MobileDndManager {
   constructor() {
     this.previousFilterInt = 1; // 1 = INTERRUPTION_FILTER_ALL on Android
     this.previousFilterName = 'INTERRUPTION_FILTER_ALL';
+    this.activeFilterName = 'INTERRUPTION_FILTER_ALL';
+    this.isDndActive = false;
     this.iosShortcutConfigured = false;
+    this.quarantinedNotifications = [];
+    this.policy = {
+      allowVipContacts: true,
+      allowAlarms: true,
+      blacklistedApps: ['Instagram', 'TikTok', 'Discord'],
+    };
   }
 
   setIosShortcutConfigured(configured) {
     this.iosShortcutConfigured = Boolean(configured);
+  }
+
+  /**
+   * Intercepts incoming notifications while DND is active and either blocks/quarantines
+   * them in the vault or allows priority VIP/Alarm alerts through.
+   */
+  interceptNotification(notification) {
+    const app = notification.app || 'App';
+    const category = notification.category || 'social';
+
+    if (!this.isDndActive && !this.policy.blacklistedApps.includes(app)) {
+      return { blocked: false, reason: 'DND Inactive (INTERRUPTION_FILTER_ALL)' };
+    }
+
+    if (this.activeFilterName === 'INTERRUPTION_FILTER_PRIORITY') {
+      if (category === 'alarm' && this.policy.allowAlarms) {
+        return { blocked: false, reason: 'Allowed System Alarm' };
+      }
+      if (category === 'vip_contact' && this.policy.allowVipContacts) {
+        return { blocked: false, reason: 'Allowed VIP Starred Contact' };
+      }
+    } else if (this.activeFilterName === 'INTERRUPTION_FILTER_ALARMS') {
+      if (category === 'alarm') {
+        return { blocked: false, reason: 'Allowed System Alarm' };
+      }
+    }
+
+    const record = {
+      ...notification,
+      id: notification.id || `${Date.now()}`,
+      interceptedAt: new Date().toISOString(),
+      filterMode: this.activeFilterName,
+    };
+    this.quarantinedNotifications.unshift(record);
+    return {
+      blocked: true,
+      reason: `Blocked by ${this.activeFilterName}`,
+      record,
+    };
+  }
+
+  getQuarantinedNotifications() {
+    return [...this.quarantinedNotifications];
+  }
+
+  flushQuarantinedDigest() {
+    const digest = [...this.quarantinedNotifications];
+    this.quarantinedNotifications = [];
+    return digest;
   }
 
   /**
@@ -27,7 +86,7 @@ export class MobileDndManager {
           platform: 'android',
           canToggleSystemDnd: false,
           permissionGranted: false,
-          currentStateName: 'INTERRUPTION_FILTER_ALL',
+          currentStateName: this.activeFilterName,
           reason: 'Native module requires Expo Dev Build (`npx expo run:android`).',
         };
       }
@@ -47,7 +106,7 @@ export class MobileDndManager {
         platform: 'ios',
         canToggleSystemDnd: canOpenShortcuts && this.iosShortcutConfigured,
         permissionGranted: this.iosShortcutConfigured,
-        currentStateName: 'IOS_STANDARD_MODE',
+        currentStateName: this.isDndActive ? 'IOS_FOCUS_DO_NOT_DISTURB' : 'IOS_STANDARD_MODE',
         reason:
           'iOS sandboxes direct DND toggles. Uses Apple Shortcuts ("QuietPulse DND") or Focus Filter.',
       };
@@ -75,7 +134,10 @@ export class MobileDndManager {
    * Activates DND when a Focus Session starts and captures the prior state for restoration.
    * Falls back to `in_app_fullscreen` if OS permission or Shortcuts automation is unavailable.
    */
-  async activateForSession() {
+  async activateForSession(targetFilter = 'INTERRUPTION_FILTER_PRIORITY') {
+    this.isDndActive = true;
+    this.activeFilterName = targetFilter;
+
     if (Platform.OS === 'android' && QuietPulseDnd) {
       const res = await QuietPulseDnd.enableDnd();
       if (res && res.applied) {
@@ -107,7 +169,7 @@ export class MobileDndManager {
       }
     }
 
-    // Universal fallback: Full-screen in-app focus mode
+    // Universal fallback: Full-screen in-app focus mode + Notification Firewall
     return {
       appliedMode: 'in_app_fullscreen',
       previousState: this.previousFilterName,
@@ -116,11 +178,17 @@ export class MobileDndManager {
   }
 
   /**
-   * Restores the exact previous DND state when a Focus Session ends or is cancelled.
+   * Restores the exact previous DND state when a Focus Session ends or is cancelled,
+   * and returns the digest of any notifications blocked during the session.
    */
   async restoreAfterSession(appliedMode) {
+    this.isDndActive = false;
+    this.activeFilterName = this.previousFilterName || 'INTERRUPTION_FILTER_ALL';
+    const blockedDigest = this.flushQuarantinedDigest();
+
     if (Platform.OS === 'android' && QuietPulseDnd && appliedMode === 'native_os') {
-      return QuietPulseDnd.restoreDnd(this.previousFilterInt);
+      await QuietPulseDnd.restoreDnd(this.previousFilterInt);
+      return { restored: true, blockedDigest };
     }
 
     if (Platform.OS === 'ios' && appliedMode === 'shortcut_bridge') {
@@ -128,11 +196,11 @@ export class MobileDndManager {
       const supported = await Linking.canOpenURL(shortcutUrl);
       if (supported) {
         await Linking.openURL(shortcutUrl);
-        return { restored: true };
+        return { restored: true, blockedDigest };
       }
     }
 
-    return { restored: true, mode: 'in_app_fullscreen_closed' };
+    return { restored: true, mode: 'in_app_fullscreen_closed', blockedDigest };
   }
 }
 

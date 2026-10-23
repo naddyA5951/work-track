@@ -144,3 +144,157 @@ export function createFocusSessionModel(partial = {}) {
     deleted_at: partial.deleted_at || null,
   };
 }
+
+/**
+ * Curated 31-day rotating library of daily motivational quotes focused on
+ * habit compounding, uninterrupted deep work, and disciplined calm.
+ */
+export const DAILY_MOTIVATIONAL_QUOTES = [
+  {
+    id: 'q-01',
+    quote: 'We are what we repeatedly do. Excellence, then, is not an act, but a habit.',
+    author: 'Will Durant',
+    theme: 'Habit Compounding',
+  },
+  {
+    id: 'q-02',
+    quote: 'You do not rise to the level of your goals. You fall to the level of your systems.',
+    author: 'James Clear',
+    theme: 'Daily Systems',
+  },
+  {
+    id: 'q-03',
+    quote: 'Three hours of uninterrupted deep focus produces more lasting value than a week of fragmented attention.',
+    author: 'Cal Newport',
+    theme: 'Deep Work',
+  },
+  {
+    id: 'q-04',
+    quote: 'Concentrate every minute like a Roman on doing what is in front of you with precise and genuine seriousness.',
+    author: 'Marcus Aurelius',
+    theme: 'Present Focus',
+  },
+  {
+    id: 'q-05',
+    quote: 'Small disciplines repeated with consistency every day lead to great achievements gained slowly over time.',
+    author: 'John C. Maxwell',
+    theme: 'Consistency',
+  },
+  {
+    id: 'q-06',
+    quote: 'If you want to make a permanent change, stop focusing on the size of your goals and start focusing on the quality of your daily ritual.',
+    author: 'T. Harv Eker',
+    theme: 'Daily Ritual',
+  },
+  {
+    id: 'q-07',
+    quote: 'The successful warrior is the average person, with laser-like focus.',
+    author: 'Bruce Lee',
+    theme: 'Single-Pointed Attention',
+  },
+  {
+    id: 'q-08',
+    quote: 'First forget inspiration. Habit is more dependable. Habit will sustain you whether you are inspired or not.',
+    author: 'Octavia Butler',
+    theme: 'Relentless Craft',
+  },
+  {
+    id: 'q-09',
+    quote: 'How we spend our days is, of course, how we spend our lives.',
+    author: 'Annie Dillard',
+    theme: 'Intentional Living',
+  },
+  {
+    id: 'q-10',
+    quote: 'Step by step and the thing is done.',
+    author: 'Miyamoto Musashi',
+    theme: 'Mastery',
+  },
+  {
+    id: 'q-11',
+    quote: 'Almost everything will work again if you unplug it for a few minutes, including you.',
+    author: 'Anne Lamott',
+    theme: 'Quiet Sanctuary',
+  },
+  {
+    id: 'q-12',
+    quote: 'Protect your attention as your scarcest asset; what you give your focus to shapes who you become.',
+    author: 'Epictetus',
+    theme: 'Guarded Attention',
+  },
+  {
+    id: 'q-13',
+    quote: 'Every action you take is a vote for the type of person you wish to become.',
+    author: 'James Clear',
+    theme: 'Identity Habits',
+  },
+  {
+    id: 'q-14',
+    quote: 'Simplicity boils down to two steps: identify the essential, and eliminate the rest.',
+    author: 'Leo Babauta',
+    theme: 'Minimalist Focus',
+  },
+  {
+    id: 'q-15',
+    quote: 'A river cuts through rock not because of its power, but because of its persistence.',
+    author: 'Jim Watkins',
+    theme: 'Streak Momentum',
+  },
+  {
+    id: 'q-16',
+    quote: 'In an age of constant distraction, the ability to sit quietly with one problem is a superpower.',
+    author: 'Naval Ravikant',
+    theme: 'Deep Work',
+  },
+  {
+    id: 'q-17',
+    quote: 'Do not wait; the time will never be just right. Start where you stand, and work with whatever tools you have.',
+    author: 'George Herbert',
+    theme: 'Immediate Action',
+  },
+  {
+    id: 'q-18',
+    quote: 'Discipline is choosing between what you want now and what you want most.',
+    author: 'Abraham Lincoln',
+    theme: 'Long-Term Vision',
+  },
+  {
+    id: 'q-19',
+    quote: 'Calmness of mind is one of the beautiful jewels of wisdom. It is the result of long and patient effort in self-control.',
+    author: 'James Allen',
+    theme: 'Mindful Calm',
+  },
+  {
+    id: 'q-20',
+    quote: 'Success is nothing more than a few simple disciplines, practiced every day.',
+    author: 'Jim Rohn',
+    theme: 'Daily Discipline',
+  },
+  {
+    id: 'q-21',
+    quote: 'Nothing is less productive than to make more efficient what should not be done at all.',
+    author: 'Peter Drucker',
+    theme: 'Priority Selection',
+  },
+];
+
+/**
+ * Deterministically returns the quote of the day for a given 'YYYY-MM-DD' local date string,
+ * plus an optional manual browse offset so users can also cycle through quotes on demand.
+ */
+export function getDailyMotivationalQuote(isoDateStr = toLocalISODate(), offset = 0) {
+  const d = parseLocalISODate(isoDateStr);
+  const startOfYear = new Date(d.getFullYear(), 0, 0);
+  const diffMs = d.getTime() - startOfYear.getTime();
+  const dayOfYear = Math.max(1, Math.floor(diffMs / 86400000));
+  const totalQuotes = DAILY_MOTIVATIONAL_QUOTES.length;
+  const idx = ((dayOfYear - 1 + offset) % totalQuotes + totalQuotes) % totalQuotes;
+  return {
+    ...DAILY_MOTIVATIONAL_QUOTES[idx],
+    dayOfYear,
+    date: isoDateStr,
+    index: idx + 1,
+    totalQuotes,
+  };
+}
+

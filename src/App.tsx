@@ -50,6 +50,7 @@ import {
   createFocusSessionModel,
   toLocalISODate,
   parseLocalISODate,
+  getDailyMotivationalQuote,
   computeHabitStats,
   buildCompletionSeries,
   computeFocusStats,
@@ -63,6 +64,16 @@ import {
   FinishPresetId,
 } from './components/ZenFocusScene3D';
 import { usePWAInstall } from './hooks/usePWAInstall';
+import {
+  InterruptionFilterMode,
+  IncomingNotificationPayload,
+  InterceptedNotificationRecord,
+  DndPolicyRules,
+  SAMPLE_INCOMING_NOTIFICATIONS,
+  soundEngine,
+  evaluateNotificationFirewall,
+  installBrowserNotificationInterceptor,
+} from './services/dndBlockerEngine';
 
 interface HabitItem {
   id: string;
@@ -137,7 +148,9 @@ export default function App() {
   const [finishPreset, setFinishPreset] = useState<FinishPresetId>('emerald_obsidian');
   const [explodedAmount, setExplodedAmount] = useState<number>(0);
   const [kineticSpeed, setKineticSpeed] = useState<number>(1.0);
-  const [dockCollapsed, setDockCollapsed] = useState<boolean>(false);
+  const [dockCollapsed, setDockCollapsed] = useState<boolean>(true);
+  const [mobileApkSimulator, setMobileApkSimulator] = useState<boolean>(false);
+  const [copiedLiveUrl, setCopiedLiveUrl] = useState<boolean>(false);
 
   // PWA & Chrome Android APK Hook
   const {
@@ -175,6 +188,16 @@ export default function App() {
   const [focusSessions, setFocusSessions] = useState<FocusSessionItem[]>([]);
   const [selectedDate, setSelectedDate] = useState<string>(toLocalISODate());
   const [justCheckedHabitId, setJustCheckedHabitId] = useState<string | null>(null);
+  const [quoteOffset, setQuoteOffset] = useState<number>(0);
+  const [copiedDailyQuote, setCopiedDailyQuote] = useState<boolean>(false);
+  const [savedQuoteIds, setSavedQuoteIds] = useState<string[]>(() => {
+    try {
+      const raw = window.localStorage.getItem('qp_saved_quotes_v1');
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
 
   // Sync & Connectivity State
   const [isOfflineSimulated, setIsOfflineSimulated] = useState<boolean>(false);
@@ -209,10 +232,69 @@ export default function App() {
   const [pauseStartedAtMs, setPauseStartedAtMs] = useState<number | null>(null);
   const [remainingSeconds, setRemainingSeconds] = useState<number>(25 * 60);
 
-  // Platform DND State Machine
+  // Platform DND State Machine & Active Notification Firewall
   const [selectedPlatform, setSelectedPlatform] = useState<PlatformTarget>('android');
   const [osDndPermissionGranted, setOsDndPermissionGranted] = useState<boolean>(true);
-  const [priorOsDndState, setPriorOsDndState] = useState<string>('INTERRUPTION_FILTER_ALL');
+  const [priorOsDndState, setPriorOsDndState] = useState<InterruptionFilterMode>(
+    'INTERRUPTION_FILTER_ALL'
+  );
+  const [interruptionFilter, setInterruptionFilter] = useState<InterruptionFilterMode>(
+    'INTERRUPTION_FILTER_ALL'
+  );
+  const [targetDndFilter, setTargetDndFilter] = useState<InterruptionFilterMode>(
+    'INTERRUPTION_FILTER_PRIORITY'
+  );
+  const [dndPolicy, setDndPolicy] = useState<DndPolicyRules>({
+    allowVipContactsInPriority: true,
+    allowAlarmsInPriority: true,
+    muteAllAudioEffects: true,
+    blockBrowserNativeNotifications: true,
+    holdBlockedInVaultForDigest: true,
+    blockedAppsBlacklist: ['Instagram', 'Discord'],
+  });
+  const [interceptedVault, setInterceptedVault] = useState<InterceptedNotificationRecord[]>([
+    {
+      id: 'seed-log-1',
+      app: 'Instagram',
+      sender: '@design.daily',
+      title: 'Live video started',
+      body: '@design.daily started a live studio tour — tap to watch now.',
+      category: 'social',
+      timestamp: new Date(Date.now() - 180000).toISOString(),
+      action: 'BLOCKED',
+      reason: 'Suppressed by Priority DND Filter (Instagram · social)',
+      filterAtTime: 'INTERRUPTION_FILTER_PRIORITY',
+    },
+    {
+      id: 'seed-log-2',
+      app: 'Slack',
+      sender: '#eng-production',
+      title: 'New thread in #eng-production',
+      body: 'Can someone review PR #418 before the 3pm deployment window?',
+      category: 'work_chat',
+      timestamp: new Date(Date.now() - 95000).toISOString(),
+      action: 'BLOCKED',
+      reason: 'Suppressed by Priority DND Filter (Slack · work_chat)',
+      filterAtTime: 'INTERRUPTION_FILTER_PRIORITY',
+    },
+  ]);
+  const [sessionQuarantineCount, setSessionQuarantineCount] = useState<number>(0);
+  const [liveAllowedToast, setLiveAllowedToast] = useState<InterceptedNotificationRecord | null>(
+    null
+  );
+  const [liveBlockedBanner, setLiveBlockedBanner] = useState<InterceptedNotificationRecord | null>(
+    null
+  );
+  const [autoSimulateTraffic, setAutoSimulateTraffic] = useState<boolean>(false);
+  const [customTestApp, setCustomTestApp] = useState<string>('Slack');
+  const [customTestTitle, setCustomTestTitle] = useState<string>(
+    'Urgent ping: Production deploy check'
+  );
+  const [customTestCategory, setCustomTestCategory] = useState<
+    'work_chat' | 'social' | 'email' | 'vip_contact' | 'alarm'
+  >('work_chat');
+  const [wakeLockActive, setWakeLockActive] = useState<boolean>(false);
+
   const [liveDndState, setLiveDndState] = useState<{
     active: boolean;
     mode: 'idle' | 'native_os' | 'shortcut_bridge' | 'in_app_fullscreen';
@@ -221,7 +303,7 @@ export default function App() {
   }>({
     active: false,
     mode: 'idle',
-    statusLabel: 'Standard Notifications Active',
+    statusLabel: 'Standard Notifications Active (INTERRUPTION_FILTER_ALL)',
     restoredBanner: null,
   });
   const [fullscreenFocusLockout, setFullscreenFocusLockout] = useState<boolean>(false);
@@ -562,7 +644,152 @@ export default function App() {
     }
   };
 
-  // Start a Focus Session & Automatically Enable Platform DND
+  // Dispatch / Test an Incoming Notification through the DND Firewall
+  const handleDispatchIncomingNotification = useCallback(
+    (payload: IncomingNotificationPayload) => {
+      const decision = evaluateNotificationFirewall(payload, interruptionFilter, dndPolicy);
+      const record: InterceptedNotificationRecord = {
+        id: payload.id || `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        app: payload.app,
+        sender: payload.sender,
+        title: payload.title,
+        body: payload.body,
+        category: payload.category,
+        timestamp: payload.timestamp || new Date().toISOString(),
+        action: decision.action,
+        reason: decision.reason,
+        filterAtTime: interruptionFilter,
+      };
+
+      setInterceptedVault((prev) => [record, ...prev.slice(0, 49)]);
+
+      if (decision.action === 'BLOCKED') {
+        setSessionQuarantineCount((c) => c + 1);
+        setLiveBlockedBanner(record);
+        setLiveAllowedToast(null);
+      } else {
+        setLiveAllowedToast(record);
+        setLiveBlockedBanner(null);
+        // Play Web Audio notification chime unless muted during active DND
+        if (!(liveDndState.active && dndPolicy.muteAllAudioEffects)) {
+          soundEngine.playAllowedNotificationChime();
+        }
+      }
+      return record;
+    },
+    [interruptionFilter, dndPolicy, liveDndState.active]
+  );
+
+  // Install global browser window.Notification proxy interceptor
+  useEffect(() => {
+    const uninstall = installBrowserNotificationInterceptor(() => ({
+      filterMode: interruptionFilter,
+      policy: dndPolicy,
+      onIntercepted: (record) => {
+        setInterceptedVault((prev) => [record, ...prev.slice(0, 49)]);
+        if (record.action === 'BLOCKED') {
+          setSessionQuarantineCount((c) => c + 1);
+          setLiveBlockedBanner(record);
+        } else {
+          setLiveAllowedToast(record);
+        }
+      },
+    }));
+    return uninstall;
+  }, [interruptionFilter, dndPolicy]);
+
+  // Auto-dismiss live allowed toast or blocked shield banner after 4 seconds
+  useEffect(() => {
+    if (!liveAllowedToast && !liveBlockedBanner) return undefined;
+    const timer = window.setTimeout(() => {
+      setLiveAllowedToast(null);
+      setLiveBlockedBanner(null);
+    }, 4000);
+    return () => window.clearTimeout(timer);
+  }, [liveAllowedToast, liveBlockedBanner]);
+
+  // Background auto-simulation of incoming app notifications when enabled
+  useEffect(() => {
+    if (!autoSimulateTraffic) return undefined;
+    let idx = 0;
+    const interval = window.setInterval(() => {
+      const sample =
+        SAMPLE_INCOMING_NOTIFICATIONS[idx % SAMPLE_INCOMING_NOTIFICATIONS.length];
+      idx += 1;
+      handleDispatchIncomingNotification({
+        ...sample,
+        id: `auto-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+      });
+    }, 6500);
+    return () => window.clearInterval(interval);
+  }, [autoSimulateTraffic, handleDispatchIncomingNotification]);
+
+  // Acquire / release Screen Wake Lock when DND is active
+  useEffect(() => {
+    let wakeLockSentinel: { release: () => Promise<void> } | null = null;
+    const navWithWakeLock = navigator as unknown as {
+      wakeLock?: { request: (type: 'screen') => Promise<{ release: () => Promise<void> }> };
+    };
+
+    if (liveDndState.active && navWithWakeLock.wakeLock) {
+      navWithWakeLock.wakeLock
+        .request('screen')
+        .then((sentinel) => {
+          wakeLockSentinel = sentinel;
+          setWakeLockActive(true);
+        })
+        .catch(() => {
+          setWakeLockActive(false);
+        });
+    } else {
+      setWakeLockActive(false);
+    }
+
+    return () => {
+      if (wakeLockSentinel) {
+        wakeLockSentinel.release().catch(() => {});
+      }
+    };
+  }, [liveDndState.active]);
+
+  // Standalone 1-Click Toggle for DND & Notification Blocker (works anytime or with Focus Session)
+  const handleToggleManualDndShield = () => {
+    if (liveDndState.active) {
+      const restored = priorOsDndState || 'INTERRUPTION_FILTER_ALL';
+      setInterruptionFilter(restored);
+      soundEngine.playDndToggleTone(false);
+      setAutoSimulateTraffic(false);
+      setLiveDndState({
+        active: false,
+        mode: 'idle',
+        statusLabel: `Restored Previous Filter (${restored})`,
+        restoredBanner: `DND Shield turned OFF: Restored to ${restored}. ${sessionQuarantineCount} notifications were intercepted while DND was active.`,
+      });
+      setSessionQuarantineCount(0);
+    } else {
+      setPriorOsDndState(interruptionFilter);
+      const nextFilter =
+        targetDndFilter === 'INTERRUPTION_FILTER_ALL'
+          ? 'INTERRUPTION_FILTER_PRIORITY'
+          : targetDndFilter;
+      setInterruptionFilter(nextFilter);
+      soundEngine.playDndToggleTone(true);
+      setSessionQuarantineCount(0);
+      setLiveDndState({
+        active: true,
+        mode: osDndPermissionGranted
+          ? selectedPlatform === 'ios'
+            ? 'shortcut_bridge'
+            : 'native_os'
+          : 'in_app_fullscreen',
+        statusLabel: `Active Notification Blocker (${nextFilter})`,
+        restoredBanner: null,
+      });
+    }
+  };
+
+  // Start a Focus Session & Automatically Enable Platform DND + Notification Blocker
   const handleStartFocusSession = async (overrideHabit?: HabitItem) => {
     const durationMin = overrideHabit ? overrideHabit.default_focus_minutes : focusDurationMin;
     const targetHabitId = overrideHabit ? overrideHabit.id : linkedHabitId || null;
@@ -570,11 +797,24 @@ export default function App() {
     if (overrideHabit) {
       setFocusDurationMin(overrideHabit.default_focus_minutes);
       setLinkedHabitId(overrideHabit.id);
-      setActiveTab('focus');
+      handleSelectTab('focus');
     }
 
     let appliedMode: 'native_os' | 'shortcut_bridge' | 'in_app_fullscreen' = 'native_os';
-    let capturedPreviousState = priorOsDndState;
+    const capturedPreviousState: InterruptionFilterMode =
+      interruptionFilter === 'INTERRUPTION_FILTER_ALL'
+        ? 'INTERRUPTION_FILTER_ALL'
+        : priorOsDndState;
+    setPriorOsDndState(capturedPreviousState);
+
+    const activeDndFilter: InterruptionFilterMode =
+      targetDndFilter === 'INTERRUPTION_FILTER_ALL'
+        ? 'INTERRUPTION_FILTER_PRIORITY'
+        : targetDndFilter;
+    setInterruptionFilter(activeDndFilter);
+    setSessionQuarantineCount(0);
+    soundEngine.playDndToggleTone(true);
+
     let statusLabel = '';
 
     const winWithElectron = window as unknown as {
@@ -592,36 +832,26 @@ export default function App() {
         requestFullscreenFallback: !osDndPermissionGranted,
       });
       appliedMode = electronRes.appliedMode;
-      capturedPreviousState = electronRes.previousState;
       statusLabel =
         appliedMode === 'native_os'
-          ? 'Windows Toast Notifications Muted (PowerShell Registry Helper)'
-          : 'In-App Full-Screen Focus Lockout Active';
+          ? `Windows Toast Blocker Active (${activeDndFilter})`
+          : 'In-App Full-Screen Focus Lockout + Notification Blocker Active';
       if (electronRes.fullscreenFallback) {
         setFullscreenFocusLockout(true);
       }
     } else if (!osDndPermissionGranted) {
       appliedMode = 'in_app_fullscreen';
-      capturedPreviousState =
-        selectedPlatform === 'android'
-          ? 'INTERRUPTION_FILTER_ALL'
-          : selectedPlatform === 'ios'
-            ? 'IOS_FOCUS_OFF'
-            : 'WINDOWS_TOASTS_ENABLED';
-      statusLabel = 'In-App Full-Screen Focus Mode (OS DND Fallback)';
+      statusLabel = `In-App Full-Screen Focus Mode + Notification Blocker (${activeDndFilter})`;
       setFullscreenFocusLockout(true);
     } else if (selectedPlatform === 'android') {
       appliedMode = 'native_os';
-      capturedPreviousState = priorOsDndState || 'INTERRUPTION_FILTER_ALL';
-      statusLabel = 'Android NotificationManager: INTERRUPTION_FILTER_PRIORITY';
+      statusLabel = `Android NotificationManager: ${activeDndFilter}`;
     } else if (selectedPlatform === 'ios') {
       appliedMode = 'shortcut_bridge';
-      capturedPreviousState = 'IOS_FOCUS_OFF';
-      statusLabel = 'iOS Shortcuts Automation ("QuietPulse DND") + Focus Filter Active';
+      statusLabel = `iOS Shortcuts ("QuietPulse DND") + ${activeDndFilter}`;
     } else {
       appliedMode = 'native_os';
-      capturedPreviousState = 'WINDOWS_TOASTS_ENABLED';
-      statusLabel = 'Windows Focus Assist Helper Active + App Notifications Suppressed';
+      statusLabel = `Windows Focus Assist Helper + Notification Blocker (${activeDndFilter})`;
     }
 
     setLiveDndState({
@@ -703,13 +933,19 @@ export default function App() {
       ...focusSessions.filter((s) => s.id !== completedSession.id),
     ];
 
-    const restoredStateName = activeSession.previous_dnd_state || 'INTERRUPTION_FILTER_ALL';
+    const restoredStateName =
+      (activeSession.previous_dnd_state as InterruptionFilterMode) || 'INTERRUPTION_FILTER_ALL';
+    setInterruptionFilter(restoredStateName);
+    setAutoSimulateTraffic(false);
+    soundEngine.playDndToggleTone(false);
+
     setLiveDndState({
       active: false,
       mode: 'idle',
       statusLabel: `Restored Previous State (${restoredStateName})`,
-      restoredBanner: `Session ${finalStatus}: System DND automatically restored to ${restoredStateName}.`,
+      restoredBanner: `Session ${finalStatus}: System DND automatically restored to ${restoredStateName}. (${sessionQuarantineCount} notifications intercepted during session)`,
     });
+    setSessionQuarantineCount(0);
     setFullscreenFocusLockout(false);
     setActiveSession(null);
     setIsTimerPaused(false);
@@ -808,10 +1044,33 @@ export default function App() {
     }
   };
 
+  // Automatically expand 3D dock on 3D Sanctuary tab and collapse on data tabs to avoid card overlap
+  const handleSelectTab = (tab: NavTab) => {
+    setActiveTab(tab);
+    setDockCollapsed(tab !== 'sanctuary');
+  };
+
   const visibleHabits = useMemo(
     () => habits.filter((h) => !h.deleted_at && !h.archived),
     [habits]
   );
+
+  const dailyQuote = useMemo(
+    () => getDailyMotivationalQuote(selectedDate, quoteOffset),
+    [selectedDate, quoteOffset]
+  );
+
+  const handleToggleSaveQuote = (quoteId: string) => {
+    const next = savedQuoteIds.includes(quoteId)
+      ? savedQuoteIds.filter((id) => id !== quoteId)
+      : [...savedQuoteIds, quoteId];
+    setSavedQuoteIds(next);
+    try {
+      window.localStorage.setItem('qp_saved_quotes_v1', JSON.stringify(next));
+    } catch {
+      // ignore storage quota errors
+    }
+  };
 
   const habitStatsMap = useMemo(() => {
     const map: Record<
@@ -1023,7 +1282,7 @@ export default function App() {
             return (
               <button
                 key={item.id}
-                onClick={() => setActiveTab(item.id as NavTab)}
+                onClick={() => handleSelectTab(item.id as NavTab)}
                 className={`py-1 transition-colors whitespace-nowrap shrink-0 cursor-pointer border-b-2 ${
                   isCurrent
                     ? 'border-emerald-500 text-emerald-500 font-semibold'
@@ -1048,7 +1307,7 @@ export default function App() {
               ? 'APK Installed'
               : isInstallable
                 ? 'Install Android APK'
-                : 'Launch Android APK'}
+                : 'Launch / Download APK'}
           </button>
         </div>
       </header>
@@ -1070,7 +1329,7 @@ export default function App() {
             return (
               <button
                 key={t.id}
-                onClick={() => setActiveTab(t.id)}
+                onClick={() => handleSelectTab(t.id)}
                 className={`min-h-[36px] px-3.5 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   active
                     ? 'bg-indigo-600 text-white font-semibold'
@@ -1085,15 +1344,41 @@ export default function App() {
           })}
         </div>
 
-        {/* Workspace Controls: Active Session, Offline Switch, Sync, Theme, Account */}
+        {/* Workspace Controls: 1-Click DND Blocker Toggle, Active Session, Offline Switch, Sync, Theme, Account */}
         <div className="flex items-center gap-2 flex-wrap">
+          {/* 1-Click Live DND & Notification Blocker Toggle */}
+          <button
+            onClick={handleToggleManualDndShield}
+            className={`min-h-[38px] px-3 py-1.5 rounded-lg text-xs font-semibold border flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+              liveDndState.active
+                ? 'bg-emerald-600 border-emerald-500 text-white'
+                : darkMode
+                  ? 'bg-[#0B0F17] border-slate-800 text-slate-300 hover:border-slate-700'
+                  : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+            }`}
+          >
+            {liveDndState.active ? (
+              <>
+                <ShieldCheck className="w-4 h-4" />
+                <span>
+                  DND Blocker ON ({interruptionFilter.replace('INTERRUPTION_FILTER_', '')}) ·{' '}
+                  {interceptedVault.filter((v) => v.action === 'BLOCKED').length} Blocked
+                </span>
+              </>
+            ) : (
+              <>
+                <Shield className="w-4 h-4 text-indigo-400" />
+                <span>Enable DND Blocker</span>
+              </>
+            )}
+          </button>
+
           {activeSession && (
             <button
-              onClick={() => setActiveTab('focus')}
+              onClick={() => handleSelectTab('focus')}
               className="min-h-[38px] px-3 py-1.5 rounded-lg bg-indigo-600/25 border border-indigo-500/40 text-indigo-300 text-xs font-medium flex items-center gap-2 cursor-pointer whitespace-nowrap shrink-0"
             >
-              <ShieldCheck className="w-4 h-4" />
-              <span>DND Active:</span>
+              <Clock className="w-3.5 h-3.5" />
               <span className="font-mono tabular-nums font-bold">
                 {formatTimer(remainingSeconds)}
               </span>
@@ -1162,6 +1447,55 @@ export default function App() {
         </div>
       </div>
 
+      {/* LIVE OS NOTIFICATION TOAST (When Allowed) OR DND SHIELD INTERCEPT BANNER (When Blocked) */}
+      {(liveAllowedToast || liveBlockedBanner) && (
+        <div className="fixed top-20 right-6 z-50 max-w-sm w-full pointer-events-auto">
+          {liveAllowedToast && (
+            <div className="p-4 rounded-xl border border-amber-500/50 bg-[#0F1624] text-slate-100 shadow-2xl space-y-1.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-bold text-amber-400">
+                  {liveAllowedToast.app} · {liveAllowedToast.sender}
+                </span>
+                <button
+                  onClick={() => setLiveAllowedToast(null)}
+                  className="text-slate-400 hover:text-white cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <div className="text-sm font-semibold">{liveAllowedToast.title}</div>
+              <div className="text-xs text-slate-300">{liveAllowedToast.body}</div>
+              <div className="text-[11px] font-mono text-amber-300/90 pt-1">
+                {liveAllowedToast.reason}
+              </div>
+            </div>
+          )}
+
+          {liveBlockedBanner && (
+            <div className="p-4 rounded-xl border border-emerald-500/50 bg-[#0B1512] text-emerald-100 shadow-2xl space-y-1.5">
+              <div className="flex items-center justify-between text-xs">
+                <div className="flex items-center gap-1.5 font-bold text-emerald-400">
+                  <ShieldCheck className="w-4 h-4" />
+                  <span>DND Firewall Blocked {liveBlockedBanner.app}</span>
+                </div>
+                <button
+                  onClick={() => setLiveBlockedBanner(null)}
+                  className="text-slate-400 hover:text-white cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <div className="text-xs text-slate-300 line-through opacity-75">
+                {liveBlockedBanner.title} — {liveBlockedBanner.body}
+              </div>
+              <div className="text-[11px] font-mono text-emerald-400 pt-0.5">
+                {liveBlockedBanner.reason} (Audio Muted &amp; Quarantined)
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* =====================================================================
           TAB 3: 3D ZEN SANCTUARY (100% Unobstructed Central 3D Viewport)
          ===================================================================== */}
@@ -1190,7 +1524,107 @@ export default function App() {
         <main className="relative z-10 flex-1 max-w-7xl w-full mx-auto px-6 lg:px-10 py-7 pb-36">
           {/* TAB 1: DASHBOARD & DAILY HABITS */}
           {activeTab === 'dashboard' && (
-            <div className="space-y-7">
+            <div className="space-y-6">
+              {/* DAILY MOTIVATIONAL QUOTE BANNER (Rotates automatically every day) */}
+              <div className={`p-5 sm:p-6 rounded-xl border ${surfaceCardClass}`}>
+                <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                  <div className="space-y-2 max-w-3xl">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs font-mono tabular-nums text-emerald-400">
+                      <span>Daily Motivation</span>
+                      <span aria-hidden="true">·</span>
+                      <span>Day {dailyQuote.dayOfYear} of 365</span>
+                      <span aria-hidden="true">·</span>
+                      <span className="text-indigo-400">{dailyQuote.theme}</span>
+                      <span aria-hidden="true">·</span>
+                      <span className="text-slate-400">{selectedDate}</span>
+                    </div>
+
+                    <blockquote
+                      className="text-base sm:text-lg font-semibold font-display leading-snug tracking-tight"
+                      style={{ textWrap: 'balance' }}
+                    >
+                      “{dailyQuote.quote}”
+                    </blockquote>
+
+                    <div className="text-xs text-slate-400 font-medium">
+                      — {dailyQuote.author}
+                      {savedQuoteIds.includes(dailyQuote.id) && (
+                        <span className="ml-2 font-mono text-emerald-400">
+                          · Saved in Favorites ({savedQuoteIds.length})
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    {quoteOffset !== 0 && (
+                      <button
+                        onClick={() => setQuoteOffset(0)}
+                        className={`min-h-[38px] px-3 py-1.5 rounded-lg border text-xs font-medium cursor-pointer whitespace-nowrap ${
+                          darkMode
+                            ? 'bg-slate-900 border-slate-800 text-slate-300 hover:text-white'
+                            : 'bg-slate-100 border-slate-200 text-slate-700 hover:text-slate-900'
+                        }`}
+                      >
+                        Today’s Quote
+                      </button>
+                    )}
+
+                    <button
+                      onClick={() => setQuoteOffset((prev) => prev + 1)}
+                      className={`min-h-[38px] px-3 py-1.5 rounded-lg border text-xs font-medium flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
+                        darkMode
+                          ? 'bg-slate-900 border-slate-800 text-slate-200 hover:border-slate-700'
+                          : 'bg-slate-50 border-slate-200 text-slate-700 hover:bg-slate-100'
+                      }`}
+                    >
+                      <RefreshCw className="w-3.5 h-3.5 text-indigo-400" />
+                      <span>Next Quote</span>
+                    </button>
+
+                    <button
+                      onClick={() => handleToggleSaveQuote(dailyQuote.id)}
+                      className={`min-h-[38px] px-3 py-1.5 rounded-lg border text-xs font-medium cursor-pointer whitespace-nowrap ${
+                        savedQuoteIds.includes(dailyQuote.id)
+                          ? 'bg-emerald-600/20 border-emerald-500/40 text-emerald-300 font-semibold'
+                          : darkMode
+                            ? 'bg-slate-900 border-slate-800 text-slate-300 hover:text-white'
+                            : 'bg-slate-50 border-slate-200 text-slate-700 hover:text-slate-900'
+                      }`}
+                    >
+                      {savedQuoteIds.includes(dailyQuote.id) ? 'Saved ★' : 'Save Quote'}
+                    </button>
+
+                    <button
+                      onClick={() => {
+                        navigator.clipboard.writeText(
+                          `"${dailyQuote.quote}" — ${dailyQuote.author}`
+                        );
+                        setCopiedDailyQuote(true);
+                        setTimeout(() => setCopiedDailyQuote(false), 2000);
+                      }}
+                      className={`min-h-[38px] px-3 py-1.5 rounded-lg border text-xs font-medium flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
+                        darkMode
+                          ? 'bg-slate-900 border-slate-800 text-slate-300 hover:text-white'
+                          : 'bg-slate-50 border-slate-200 text-slate-700 hover:text-slate-900'
+                      }`}
+                    >
+                      {copiedDailyQuote ? (
+                        <>
+                          <CheckCheck className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>Copied</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5" />
+                          <span>Copy</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
               {/* Date Scroller + Add Habit Row */}
               <div className="flex flex-wrap items-center justify-between gap-4">
                 <div className="flex items-center gap-1.5 overflow-x-auto py-0.5">
@@ -1199,7 +1633,10 @@ export default function App() {
                     return (
                       <button
                         key={d.iso}
-                        onClick={() => setSelectedDate(d.iso)}
+                        onClick={() => {
+                          setSelectedDate(d.iso);
+                          setQuoteOffset(0);
+                        }}
                         className={`min-h-[40px] px-3 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer flex items-center gap-1.5 ${
                           isSelected
                             ? 'bg-indigo-600 text-white font-semibold'
@@ -1414,16 +1851,23 @@ export default function App() {
                   })}
                 </div>
 
-                {/* Right 4 Columns: Quick Focus & Weekly Snapshot */}
+                {/* Right 4 Columns: Quick Focus, Live Notification Blocker Test & Weekly Snapshot */}
                 <div className="lg:col-span-4 space-y-6">
                   <div className={`p-6 rounded-xl border space-y-4 ${surfaceCardClass}`}>
                     <div className="flex items-center justify-between">
-                      <h3 className="text-base font-bold font-display">Quick DND Focus</h3>
-                      <Shield className="w-5 h-5 text-indigo-400" />
+                      <h3 className="text-base font-bold font-display">
+                        Quick DND &amp; Notification Blocker
+                      </h3>
+                      {liveDndState.active ? (
+                        <ShieldCheck className="w-5 h-5 text-emerald-400" />
+                      ) : (
+                        <Shield className="w-5 h-5 text-indigo-400" />
+                      )}
                     </div>
                     <p className="text-xs text-slate-400 leading-relaxed">
-                      Launch a preset session to accelerate the 3D Zen Chronometer and engage
-                      automatic system Do Not Disturb.
+                      {liveDndState.active
+                        ? `Notification Firewall is ACTIVE (${interruptionFilter}). Incoming Slack, social, and email alerts are silenced and quarantined.`
+                        : 'Launch a preset session or toggle the DND Blocker to automatically silence and quarantine incoming notifications.'}
                     </p>
 
                     <div className="grid grid-cols-3 gap-2">
@@ -1446,7 +1890,7 @@ export default function App() {
 
                     <button
                       onClick={() => {
-                        setActiveTab('focus');
+                        handleSelectTab('focus');
                         if (!activeSession) {
                           handleStartFocusSession();
                         }
@@ -1460,13 +1904,49 @@ export default function App() {
                           : `Start ${focusDurationMin}m DND Session`}
                       </span>
                     </button>
+
+                    {/* Instant Notification Blocker Verification right on the Dashboard */}
+                    <div className="pt-2 border-t border-slate-800/70 space-y-2">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="text-slate-400 font-medium">Test Blocker Now:</span>
+                        <span className="font-mono tabular-nums text-emerald-400">
+                          {interceptedVault.filter((v) => v.action === 'BLOCKED').length} blocked
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          onClick={() =>
+                            handleDispatchIncomingNotification(SAMPLE_INCOMING_NOTIFICATIONS[0])
+                          }
+                          className={`min-h-[38px] px-3 py-1.5 rounded-lg border text-xs font-medium cursor-pointer whitespace-nowrap ${
+                            darkMode
+                              ? 'bg-slate-900 border-slate-800 text-slate-200 hover:border-slate-700'
+                              : 'bg-slate-50 border-slate-200 text-slate-700 hover:bg-slate-100'
+                          }`}
+                        >
+                          Simulate Slack Ping
+                        </button>
+                        <button
+                          onClick={() =>
+                            handleDispatchIncomingNotification(SAMPLE_INCOMING_NOTIFICATIONS[3])
+                          }
+                          className={`min-h-[38px] px-3 py-1.5 rounded-lg border text-xs font-medium cursor-pointer whitespace-nowrap ${
+                            darkMode
+                              ? 'bg-slate-900 border-slate-800 text-slate-200 hover:border-slate-700'
+                              : 'bg-slate-50 border-slate-200 text-slate-700 hover:bg-slate-100'
+                          }`}
+                        >
+                          Simulate VIP Alert
+                        </button>
+                      </div>
+                    </div>
                   </div>
 
                   <div className={`p-6 rounded-xl border space-y-4 ${surfaceCardClass}`}>
                     <div className="flex items-center justify-between">
                       <h3 className="text-base font-bold font-display">7-Day Momentum</h3>
                       <button
-                        onClick={() => setActiveTab('analytics')}
+                        onClick={() => handleSelectTab('analytics')}
                         className="text-xs text-emerald-400 hover:underline cursor-pointer"
                       >
                         Full Charts &rarr;
@@ -1501,7 +1981,7 @@ export default function App() {
             </div>
           )}
 
-          {/* TAB 2: FOCUS STUDIO & AUTOMATIC PLATFORM DND */}
+          {/* TAB 2: FOCUS STUDIO, AUTOMATIC PLATFORM DND & NOTIFICATION BLOCKER FIREWALL */}
           {activeTab === 'focus' && (
             <div className="space-y-8">
               {liveDndState.restoredBanner && (
@@ -1528,203 +2008,608 @@ export default function App() {
               )}
 
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-                <div
-                  className={`lg:col-span-7 p-6 sm:p-8 rounded-xl border space-y-6 ${surfaceCardClass}`}
-                >
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div>
-                      <h2 className="text-xl font-bold font-display">Focus Session Timer</h2>
-                      <p className="text-xs text-slate-400 mt-0.5">
-                        Background-persistent monotonic timer synchronized with the 3D Chronometer
-                      </p>
-                    </div>
-                    <button
-                      onClick={() => setShowDndGuideModal(true)}
-                      className="min-h-[38px] px-3 py-1.5 rounded-lg border border-indigo-500/40 bg-indigo-500/15 text-indigo-300 text-xs font-medium cursor-pointer whitespace-nowrap shrink-0"
-                    >
-                      Platform DND Setup Guide
-                    </button>
-                  </div>
-
-                  {/* Radial Countdown */}
-                  <div className="flex flex-col items-center justify-center py-4">
-                    <div className="relative w-64 h-64 flex items-center justify-center">
-                      <svg className="w-full h-full -rotate-90" viewBox="0 0 120 120">
-                        <circle
-                          cx="60"
-                          cy="60"
-                          r="52"
-                          fill="none"
-                          stroke={darkMode ? '#1E293B' : '#E2E8F0'}
-                          strokeWidth="6"
-                        />
-                        <circle
-                          cx="60"
-                          cy="60"
-                          r="52"
-                          fill="none"
-                          stroke="#6366F1"
-                          strokeWidth="6"
-                          strokeLinecap="round"
-                          strokeDasharray={2 * Math.PI * 52}
-                          strokeDashoffset={
-                            2 * Math.PI * 52 * (1 - (activeSession ? timerProgressPct / 100 : 0))
-                          }
-                          className="transition-all duration-300"
-                        />
-                      </svg>
-                      <div className="absolute inset-0 flex flex-col items-center justify-center text-center">
-                        <span className="text-5xl font-bold font-mono tabular-nums tracking-tight">
-                          {formatTimer(activeSession ? remainingSeconds : focusDurationMin * 60)}
-                        </span>
-                        <span className="text-xs text-slate-400 mt-2">
-                          {activeSession
-                            ? isTimerPaused
-                              ? 'Paused'
-                              : 'DND Session Running'
-                            : `${focusDurationMin} min preset ready`}
-                        </span>
+                {/* Left 7 Columns: Timer + Live Notification Firewall Simulator */}
+                <div className="lg:col-span-7 space-y-6">
+                  <div className={`p-6 sm:p-8 rounded-xl border space-y-6 ${surfaceCardClass}`}>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h2 className="text-xl font-bold font-display">
+                          Focus Timer &amp; Automatic DND Trigger
+                        </h2>
+                        <p className="text-xs text-slate-400 mt-0.5">
+                          Starting a session snapshots your current interruption filter, engages the
+                          Notification Blocker, and restores your prior state when finished
+                        </p>
                       </div>
+                      <button
+                        onClick={() => setShowDndGuideModal(true)}
+                        className="min-h-[38px] px-3 py-1.5 rounded-lg border border-indigo-500/40 bg-indigo-500/15 text-indigo-300 text-xs font-medium cursor-pointer whitespace-nowrap shrink-0"
+                      >
+                        Platform DND Architecture
+                      </button>
                     </div>
-                  </div>
 
-                  {!activeSession ? (
-                    <div className="space-y-5">
-                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
-                        {FOCUS_PRESETS_MINUTES.map((min) => (
-                          <button
-                            key={min}
-                            onClick={() => {
-                              setFocusDurationMin(min);
-                              setRemainingSeconds(min * 60);
-                            }}
-                            className={`min-h-[44px] py-2.5 px-4 rounded-lg text-xs font-mono tabular-nums font-semibold border transition-colors cursor-pointer ${
-                              focusDurationMin === min
-                                ? 'bg-indigo-600 border-indigo-500 text-white'
-                                : darkMode
-                                  ? 'bg-slate-900 border-slate-800 text-slate-300'
-                                  : 'bg-slate-50 border-slate-200 text-slate-700'
-                            }`}
-                          >
-                            {min} min
-                          </button>
-                        ))}
-
-                        <div className="flex items-center gap-1">
-                          <input
-                            type="number"
-                            min={1}
-                            max={240}
-                            value={customDurationInput}
-                            onChange={(e) => {
-                              setCustomDurationInput(e.target.value);
-                              const val = Math.max(1, Math.min(240, Number(e.target.value) || 25));
-                              setFocusDurationMin(val);
-                              setRemainingSeconds(val * 60);
-                            }}
-                            aria-label="Custom focus minutes"
-                            className={`w-full min-h-[44px] px-3 py-2 rounded-lg border text-xs font-mono tabular-nums text-center ${
-                              darkMode
-                                ? 'bg-slate-900 border-slate-800 text-slate-200'
-                                : 'bg-slate-50 border-slate-200 text-slate-800'
-                            }`}
+                    {/* Radial Countdown */}
+                    <div className="flex flex-col items-center justify-center py-2">
+                      <div className="relative w-60 h-60 flex items-center justify-center">
+                        <svg className="w-full h-full -rotate-90" viewBox="0 0 120 120">
+                          <circle
+                            cx="60"
+                            cy="60"
+                            r="52"
+                            fill="none"
+                            stroke={darkMode ? '#1E293B' : '#E2E8F0'}
+                            strokeWidth="6"
                           />
-                          <span className="text-xs text-slate-400">m</span>
+                          <circle
+                            cx="60"
+                            cy="60"
+                            r="52"
+                            fill="none"
+                            stroke={liveDndState.active ? '#10B981' : '#6366F1'}
+                            strokeWidth="6"
+                            strokeLinecap="round"
+                            strokeDasharray={2 * Math.PI * 52}
+                            strokeDashoffset={
+                              2 * Math.PI * 52 * (1 - (activeSession ? timerProgressPct / 100 : 0))
+                            }
+                            className="transition-all duration-300"
+                          />
+                        </svg>
+                        <div className="absolute inset-0 flex flex-col items-center justify-center text-center">
+                          <span className="text-5xl font-bold font-mono tabular-nums tracking-tight">
+                            {formatTimer(activeSession ? remainingSeconds : focusDurationMin * 60)}
+                          </span>
+                          <span className="text-xs text-slate-400 mt-2">
+                            {activeSession
+                              ? isTimerPaused
+                                ? 'Paused · DND Active'
+                                : `DND Active (${interruptionFilter.replace('INTERRUPTION_FILTER_', '')})`
+                              : `${focusDurationMin} min preset ready`}
+                          </span>
                         </div>
                       </div>
+                    </div>
 
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                        <div>
-                          <label className="block text-xs text-slate-400 mb-1.5">
-                            Link Session to Habit
-                          </label>
-                          <select
-                            value={linkedHabitId}
-                            onChange={(e) => setLinkedHabitId(e.target.value)}
-                            className={`w-full min-h-[44px] px-3 py-2 rounded-lg border text-xs ${
-                              darkMode
-                                ? 'bg-slate-900 border-slate-800 text-slate-200'
-                                : 'bg-slate-50 border-slate-200 text-slate-800'
-                            }`}
-                          >
-                            <option value="">No linked habit (General Focus)</option>
-                            {visibleHabits.map((h) => (
-                              <option key={h.id} value={h.id}>
-                                {h.name}
-                              </option>
-                            ))}
-                          </select>
+                    {!activeSession ? (
+                      <div className="space-y-5">
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                          {FOCUS_PRESETS_MINUTES.map((min) => (
+                            <button
+                              key={min}
+                              onClick={() => {
+                                setFocusDurationMin(min);
+                                setRemainingSeconds(min * 60);
+                              }}
+                              className={`min-h-[44px] py-2.5 px-4 rounded-lg text-xs font-mono tabular-nums font-semibold border transition-colors cursor-pointer ${
+                                focusDurationMin === min
+                                  ? 'bg-indigo-600 border-indigo-500 text-white'
+                                  : darkMode
+                                    ? 'bg-slate-900 border-slate-800 text-slate-300'
+                                    : 'bg-slate-50 border-slate-200 text-slate-700'
+                              }`}
+                            >
+                              {min} min
+                            </button>
+                          ))}
+
+                          <div className="flex items-center gap-1">
+                            <input
+                              type="number"
+                              min={1}
+                              max={240}
+                              value={customDurationInput}
+                              onChange={(e) => {
+                                setCustomDurationInput(e.target.value);
+                                const val = Math.max(
+                                  1,
+                                  Math.min(240, Number(e.target.value) || 25)
+                                );
+                                setFocusDurationMin(val);
+                                setRemainingSeconds(val * 60);
+                              }}
+                              aria-label="Custom focus minutes"
+                              className={`w-full min-h-[44px] px-3 py-2 rounded-lg border text-xs font-mono tabular-nums text-center ${
+                                darkMode
+                                  ? 'bg-slate-900 border-slate-800 text-slate-200'
+                                  : 'bg-slate-50 border-slate-200 text-slate-800'
+                              }`}
+                            />
+                            <span className="text-xs text-slate-400">m</span>
+                          </div>
                         </div>
 
-                        <div className="flex items-end">
-                          <label className="flex items-center gap-2.5 text-xs cursor-pointer select-none min-h-[44px]">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                          <div>
+                            <label className="block text-xs text-slate-400 mb-1.5">
+                              Link Session to Habit
+                            </label>
+                            <select
+                              value={linkedHabitId}
+                              onChange={(e) => setLinkedHabitId(e.target.value)}
+                              className={`w-full min-h-[44px] px-3 py-2 rounded-lg border text-xs ${
+                                darkMode
+                                  ? 'bg-slate-900 border-slate-800 text-slate-200'
+                                  : 'bg-slate-50 border-slate-200 text-slate-800'
+                              }`}
+                            >
+                              <option value="">No linked habit (General Focus)</option>
+                              {visibleHabits.map((h) => (
+                                <option key={h.id} value={h.id}>
+                                  {h.name}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+
+                          <div>
+                            <label className="block text-xs text-slate-400 mb-1.5">
+                              Target DND Interruption Filter
+                            </label>
+                            <select
+                              value={targetDndFilter}
+                              onChange={(e) => {
+                                const mode = e.target.value as InterruptionFilterMode;
+                                setTargetDndFilter(mode);
+                                if (liveDndState.active) {
+                                  setInterruptionFilter(mode);
+                                }
+                              }}
+                              className={`w-full min-h-[44px] px-3 py-2 rounded-lg border text-xs font-mono ${
+                                darkMode
+                                  ? 'bg-slate-900 border-slate-800 text-slate-200'
+                                  : 'bg-slate-50 border-slate-200 text-slate-800'
+                              }`}
+                            >
+                              <option value="INTERRUPTION_FILTER_PRIORITY">
+                                PRIORITY_ONLY (Allow VIPs &amp; Alarms)
+                              </option>
+                              <option value="INTERRUPTION_FILTER_ALARMS">
+                                ALARMS_ONLY (Block Messages &amp; VIPs)
+                              </option>
+                              <option value="INTERRUPTION_FILTER_NONE">
+                                TOTAL_SILENCE (Block 100% + Mute Audio)
+                              </option>
+                            </select>
+                          </div>
+                        </div>
+
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <label className="flex items-center gap-2.5 text-xs cursor-pointer select-none">
                             <input
                               type="checkbox"
                               checked={autoCheckOnComplete}
                               onChange={(e) => setAutoCheckOnComplete(e.target.checked)}
                               className="w-4 h-4 rounded accent-indigo-600"
                             />
-                            <span>Auto-check habit when session finishes</span>
+                            <span>Auto-check linked habit when session finishes</span>
+                          </label>
+
+                          <label className="flex items-center gap-2.5 text-xs cursor-pointer select-none text-emerald-400">
+                            <input
+                              type="checkbox"
+                              checked={autoSimulateTraffic}
+                              onChange={(e) => setAutoSimulateTraffic(e.target.checked)}
+                              className="w-4 h-4 rounded accent-emerald-500"
+                            />
+                            <span>Auto-simulate incoming app alerts every 6s</span>
                           </label>
                         </div>
+
+                        <button
+                          onClick={() => handleStartFocusSession()}
+                          className="w-full min-h-[48px] py-3 px-6 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                        >
+                          <Play className="w-4 h-4 fill-current" />
+                          <span>Start Focus Session &amp; Auto-Enable DND Blocker</span>
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="flex flex-wrap items-center justify-center gap-3">
+                        <button
+                          onClick={handleTogglePauseTimer}
+                          className="min-h-[48px] px-5 py-2.5 rounded-xl border border-slate-700 bg-slate-900 text-slate-200 text-xs font-semibold flex items-center gap-2 cursor-pointer"
+                        >
+                          <Clock className="w-4 h-4" />
+                          <span>{isTimerPaused ? 'Resume Timer' : 'Pause Timer'}</span>
+                        </button>
+
+                        <button
+                          onClick={() => handleEndFocusSession('completed')}
+                          className="min-h-[48px] px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-2 cursor-pointer"
+                        >
+                          <Check className="w-4 h-4" />
+                          <span>Complete &amp; Restore Prior DND</span>
+                        </button>
+
+                        <button
+                          onClick={() => handleEndFocusSession('cancelled')}
+                          className="min-h-[48px] px-5 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold flex items-center gap-2 cursor-pointer"
+                        >
+                          <Square className="w-4 h-4 fill-current" />
+                          <span>Cancel &amp; Restore Prior DND</span>
+                        </button>
+
+                        <button
+                          onClick={() => setFullscreenFocusLockout(true)}
+                          className="min-h-[48px] px-4 py-2.5 rounded-xl border border-slate-700 text-slate-300 text-xs font-medium flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <Maximize2 className="w-4 h-4" />
+                          <span>Full-Screen Lockout</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* LIVE NOTIFICATION BLOCKER SIMULATOR & QUARANTINE VAULT */}
+                  <div className={`p-6 sm:p-8 rounded-xl border space-y-5 ${surfaceCardClass}`}>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h3 className="text-lg font-bold font-display">
+                          Live Notification Blocker &amp; Quarantine Vault
+                        </h3>
+                        <p className="text-xs text-slate-400 mt-0.5">
+                          Fire realistic incoming alerts below to test how the active Interruption
+                          Filter blocks distractions or permits VIPs/Alarms
+                        </p>
+                      </div>
+                      <button
+                        onClick={handleToggleManualDndShield}
+                        className={`min-h-[38px] px-3.5 py-1.5 rounded-lg text-xs font-semibold cursor-pointer whitespace-nowrap ${
+                          liveDndState.active
+                            ? 'bg-emerald-600 text-white'
+                            : 'bg-indigo-600 text-white'
+                        }`}
+                      >
+                        {liveDndState.active
+                          ? 'Turn DND Blocker OFF'
+                          : 'Turn DND Blocker ON Now'}
+                      </button>
+                    </div>
+
+                    {/* 1-Click Sample Notification Triggers */}
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 text-xs">
+                      {SAMPLE_INCOMING_NOTIFICATIONS.map((item, idx) => (
+                        <button
+                          key={idx}
+                          onClick={() => handleDispatchIncomingNotification(item)}
+                          className={`p-3 rounded-lg border text-left transition-colors cursor-pointer ${
+                            darkMode
+                              ? 'bg-slate-900 border-slate-800 hover:border-indigo-500/60'
+                              : 'bg-slate-50 border-slate-200 hover:border-indigo-400'
+                          }`}
+                        >
+                          <div className="font-bold text-indigo-400 truncate">
+                            Test {item.app}
+                          </div>
+                          <div className="text-[11px] text-slate-400 truncate mt-0.5">
+                            {item.sender} ({item.category})
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Custom Incoming Notification Form */}
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        if (!customTestTitle.trim()) return;
+                        handleDispatchIncomingNotification({
+                          app: customTestApp,
+                          sender: 'Custom Test Sender',
+                          title: customTestTitle.trim(),
+                          body: `Dispatched to test ${interruptionFilter} firewall policy`,
+                          category: customTestCategory,
+                        });
+                      }}
+                      className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 text-xs"
+                    >
+                      <select
+                        value={customTestApp}
+                        onChange={(e) => setCustomTestApp(e.target.value)}
+                        className={`sm:col-span-3 min-h-[40px] px-2.5 rounded-lg border ${
+                          darkMode
+                            ? 'bg-slate-900 border-slate-800 text-slate-200'
+                            : 'bg-slate-50 border-slate-200 text-slate-800'
+                        }`}
+                      >
+                        <option value="Slack">Slack</option>
+                        <option value="WhatsApp">WhatsApp</option>
+                        <option value="Instagram">Instagram</option>
+                        <option value="Gmail">Gmail</option>
+                        <option value="Discord">Discord</option>
+                        <option value="System Clock">System Alarm</option>
+                      </select>
+
+                      <select
+                        value={customTestCategory}
+                        onChange={(e) =>
+                          setCustomTestCategory(
+                            e.target.value as
+                              | 'work_chat'
+                              | 'social'
+                              | 'email'
+                              | 'vip_contact'
+                              | 'alarm'
+                          )
+                        }
+                        className={`sm:col-span-3 min-h-[40px] px-2.5 rounded-lg border ${
+                          darkMode
+                            ? 'bg-slate-900 border-slate-800 text-slate-200'
+                            : 'bg-slate-50 border-slate-200 text-slate-800'
+                        }`}
+                      >
+                        <option value="work_chat">Work Chat</option>
+                        <option value="social">Social Media</option>
+                        <option value="email">Email</option>
+                        <option value="vip_contact">VIP Starred</option>
+                        <option value="alarm">System Alarm</option>
+                      </select>
+
+                      <input
+                        type="text"
+                        value={customTestTitle}
+                        onChange={(e) => setCustomTestTitle(e.target.value)}
+                        placeholder="Notification message..."
+                        className={`sm:col-span-4 min-h-[40px] px-3 rounded-lg border ${
+                          darkMode
+                            ? 'bg-slate-900 border-slate-800 text-slate-200'
+                            : 'bg-slate-50 border-slate-200 text-slate-800'
+                        }`}
+                      />
+
+                      <button
+                        type="submit"
+                        className="sm:col-span-2 min-h-[40px] px-3 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold cursor-pointer whitespace-nowrap"
+                      >
+                        Send Alert
+                      </button>
+                    </form>
+
+                    {/* Quarantined & Evaluated Notifications Log Table */}
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="font-semibold text-slate-300">
+                          Intercepted Notification Firewall Log ({interceptedVault.length})
+                        </span>
+                        <button
+                          onClick={() => setInterceptedVault([])}
+                          className="text-slate-400 hover:text-white underline cursor-pointer"
+                        >
+                          Clear Vault
+                        </button>
                       </div>
 
-                      <button
-                        onClick={() => handleStartFocusSession()}
-                        className="w-full min-h-[48px] py-3 px-6 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer"
-                      >
-                        <Play className="w-4 h-4 fill-current" />
-                        <span>Start Focus Session &amp; Auto-Enable DND</span>
-                      </button>
+                      <div className="max-h-64 overflow-y-auto space-y-2 pr-1">
+                        {interceptedVault.length === 0 ? (
+                          <div className="p-4 rounded-lg border border-slate-800 text-xs text-slate-400 text-center">
+                            No notifications in vault yet. Click any Test button above to dispatch an
+                            alert.
+                          </div>
+                        ) : (
+                          interceptedVault.map((rec) => (
+                            <div
+                              key={rec.id}
+                              className={`p-3 rounded-lg border text-xs flex items-start justify-between gap-3 ${
+                                rec.action === 'BLOCKED'
+                                  ? darkMode
+                                    ? 'bg-slate-900/90 border-slate-800'
+                                  : 'bg-slate-50 border-slate-200'
+                                  : darkMode
+                                    ? 'bg-amber-950/30 border-amber-500/40'
+                                    : 'bg-amber-50 border-amber-200'
+                              }`}
+                            >
+                              <div className="min-w-0 space-y-0.5">
+                                <div className="flex items-center gap-2 font-mono text-[11px]">
+                                  <span
+                                    className={
+                                      rec.action === 'BLOCKED'
+                                        ? 'text-emerald-400 font-bold'
+                                        : 'text-amber-400 font-bold'
+                                    }
+                                  >
+                                    {rec.action}
+                                  </span>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="font-semibold text-slate-200">{rec.app}</span>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="text-slate-400">{rec.sender}</span>
+                                </div>
+                                <div className="font-medium text-slate-200 truncate">
+                                  {rec.title} — <span className="text-slate-400">{rec.body}</span>
+                                </div>
+                                <div className="text-[11px] font-mono text-slate-400">
+                                  {rec.reason}
+                                </div>
+                              </div>
+                              <span className="text-[11px] font-mono tabular-nums text-slate-400 shrink-0">
+                                {new Date(rec.timestamp).toLocaleTimeString([], {
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                  second: '2-digit',
+                                })}
+                              </span>
+                            </div>
+                          ))
+                        )}
+                      </div>
                     </div>
-                  ) : (
-                    <div className="flex flex-wrap items-center justify-center gap-3">
-                      <button
-                        onClick={handleTogglePauseTimer}
-                        className="min-h-[48px] px-5 py-2.5 rounded-xl border border-slate-700 bg-slate-900 text-slate-200 text-xs font-semibold flex items-center gap-2 cursor-pointer"
-                      >
-                        <Clock className="w-4 h-4" />
-                        <span>{isTimerPaused ? 'Resume Timer' : 'Pause Timer'}</span>
-                      </button>
-
-                      <button
-                        onClick={() => handleEndFocusSession('completed')}
-                        className="min-h-[48px] px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-2 cursor-pointer"
-                      >
-                        <Check className="w-4 h-4" />
-                        <span>Complete &amp; Restore DND</span>
-                      </button>
-
-                      <button
-                        onClick={() => handleEndFocusSession('cancelled')}
-                        className="min-h-[48px] px-5 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold flex items-center gap-2 cursor-pointer"
-                      >
-                        <Square className="w-4 h-4 fill-current" />
-                        <span>Cancel &amp; Restore DND</span>
-                      </button>
-
-                      <button
-                        onClick={() => setFullscreenFocusLockout(true)}
-                        className="min-h-[48px] px-4 py-2.5 rounded-xl border border-slate-700 text-slate-300 text-xs font-medium flex items-center gap-1.5 cursor-pointer"
-                      >
-                        <Maximize2 className="w-4 h-4" />
-                        <span>Full-Screen Lockout</span>
-                      </button>
-                    </div>
-                  )}
+                  </div>
                 </div>
 
-                {/* Right 5 Columns: Platform DND Adapter Inspector */}
+                {/* Right 5 Columns: Interruption Filter Policy & Platform DND Controller */}
                 <div className="lg:col-span-5 space-y-6">
                   <div className={`p-6 rounded-xl border space-y-4 ${surfaceCardClass}`}>
                     <div className="flex items-center justify-between">
                       <h3 className="text-base font-bold font-display">
-                        Platform DND State Controller
+                        Interruption Filter &amp; Policy Rules
                       </h3>
                       <ShieldCheck className="w-5 h-5 text-emerald-500" />
                     </div>
 
-                    <div className="grid grid-cols-3 gap-2">
+                    {/* Live Interruption Filter Switcher */}
+                    <div className="space-y-1.5">
+                      <div className="text-xs text-slate-400">Active OS / Web Interruption Filter</div>
+                      <div className="grid grid-cols-2 gap-2 text-xs">
+                        {(
+                          [
+                            {
+                              id: 'INTERRUPTION_FILTER_ALL',
+                              label: 'ALL (DND Off)',
+                            },
+                            {
+                              id: 'INTERRUPTION_FILTER_PRIORITY',
+                              label: 'PRIORITY ONLY',
+                            },
+                            {
+                              id: 'INTERRUPTION_FILTER_ALARMS',
+                              label: 'ALARMS ONLY',
+                            },
+                            {
+                              id: 'INTERRUPTION_FILTER_NONE',
+                              label: 'TOTAL SILENCE',
+                            },
+                          ] as { id: InterruptionFilterMode; label: string }[]
+                        ).map((f) => (
+                          <button
+                            key={f.id}
+                            onClick={() => {
+                              setInterruptionFilter(f.id);
+                              if (f.id === 'INTERRUPTION_FILTER_ALL') {
+                                setLiveDndState((prev) => ({
+                                  ...prev,
+                                  active: false,
+                                  mode: 'idle',
+                                  statusLabel: 'Standard Notifications Active (INTERRUPTION_FILTER_ALL)',
+                                }));
+                              } else {
+                                setTargetDndFilter(f.id);
+                                setLiveDndState((prev) => ({
+                                  ...prev,
+                                  active: true,
+                                  mode: osDndPermissionGranted ? 'native_os' : 'in_app_fullscreen',
+                                  statusLabel: `Active Notification Blocker (${f.id})`,
+                                }));
+                              }
+                            }}
+                            className={`min-h-[40px] px-3 py-2 rounded-lg font-mono text-[11px] font-semibold border transition-colors cursor-pointer ${
+                              interruptionFilter === f.id
+                                ? f.id === 'INTERRUPTION_FILTER_ALL'
+                                  ? 'bg-slate-700 border-slate-500 text-white'
+                                  : 'bg-emerald-600 border-emerald-500 text-white'
+                                : darkMode
+                                  ? 'bg-slate-900 border-slate-800 text-slate-400'
+                                  : 'bg-slate-50 border-slate-200 text-slate-600'
+                            }`}
+                          >
+                            {f.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Granular Firewall Policy Checkboxes */}
+                    <div
+                      className={`p-3.5 rounded-lg border text-xs space-y-2.5 ${
+                        darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-200'
+                      }`}
+                    >
+                      <label className="flex items-center justify-between cursor-pointer">
+                        <span>Allow Starred VIP Contacts in Priority Mode</span>
+                        <input
+                          type="checkbox"
+                          checked={dndPolicy.allowVipContactsInPriority}
+                          onChange={(e) =>
+                            setDndPolicy({
+                              ...dndPolicy,
+                              allowVipContactsInPriority: e.target.checked,
+                            })
+                          }
+                          className="w-4 h-4 accent-emerald-500"
+                        />
+                      </label>
+
+                      <label className="flex items-center justify-between cursor-pointer">
+                        <span>Allow Critical Alarms in Priority Mode</span>
+                        <input
+                          type="checkbox"
+                          checked={dndPolicy.allowAlarmsInPriority}
+                          onChange={(e) =>
+                            setDndPolicy({
+                              ...dndPolicy,
+                              allowAlarmsInPriority: e.target.checked,
+                            })
+                          }
+                          className="w-4 h-4 accent-emerald-500"
+                        />
+                      </label>
+
+                      <label className="flex items-center justify-between cursor-pointer">
+                        <span>Mute Notification Audio Chimes During DND</span>
+                        <input
+                          type="checkbox"
+                          checked={dndPolicy.muteAllAudioEffects}
+                          onChange={(e) =>
+                            setDndPolicy({
+                              ...dndPolicy,
+                              muteAllAudioEffects: e.target.checked,
+                            })
+                          }
+                          className="w-4 h-4 accent-emerald-500"
+                        />
+                      </label>
+
+                      <label className="flex items-center justify-between cursor-pointer">
+                        <span>Intercept Browser window.Notification API</span>
+                        <input
+                          type="checkbox"
+                          checked={dndPolicy.blockBrowserNativeNotifications}
+                          onChange={(e) =>
+                            setDndPolicy({
+                              ...dndPolicy,
+                              blockBrowserNativeNotifications: e.target.checked,
+                            })
+                          }
+                          className="w-4 h-4 accent-emerald-500"
+                        />
+                      </label>
+                    </div>
+
+                    {/* Always-Blocked App Blacklist Toggles */}
+                    <div className="space-y-1.5 text-xs">
+                      <div className="text-slate-400">
+                        Permanent App Blacklist (Blocked even when DND is Off):
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {['Instagram', 'Discord', 'Slack', 'Gmail', 'WhatsApp'].map((appName) => {
+                          const isBlacklisted = dndPolicy.blockedAppsBlacklist.includes(appName);
+                          return (
+                            <button
+                              key={appName}
+                              onClick={() => {
+                                const nextList = isBlacklisted
+                                  ? dndPolicy.blockedAppsBlacklist.filter((a) => a !== appName)
+                                  : [...dndPolicy.blockedAppsBlacklist, appName];
+                                setDndPolicy({ ...dndPolicy, blockedAppsBlacklist: nextList });
+                              }}
+                              className={`px-2.5 py-1 rounded-md border font-mono text-[11px] cursor-pointer ${
+                                isBlacklisted
+                                  ? 'bg-rose-600/25 border-rose-500/50 text-rose-300 font-semibold'
+                                  : darkMode
+                                    ? 'bg-slate-900 border-slate-800 text-slate-400'
+                                    : 'bg-slate-100 border-slate-200 text-slate-600'
+                              }`}
+                            >
+                              {isBlacklisted ? `Blocked: ${appName}` : appName}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Platform Target Selector */}
+                    <div className="grid grid-cols-3 gap-2 pt-1">
                       {[
                         { id: 'android', label: 'Android Native' },
                         { id: 'ios', label: 'iOS Shortcuts' },
@@ -1733,7 +2618,7 @@ export default function App() {
                         <button
                           key={plat.id}
                           onClick={() => setSelectedPlatform(plat.id as PlatformTarget)}
-                          className={`min-h-[40px] px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer whitespace-nowrap ${
+                          className={`min-h-[38px] px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer whitespace-nowrap ${
                             selectedPlatform === plat.id
                               ? 'bg-indigo-600 border-indigo-500 text-white font-semibold'
                               : darkMode
@@ -1747,44 +2632,23 @@ export default function App() {
                     </div>
 
                     <div
-                      className={`p-3.5 rounded-lg border text-xs space-y-2 ${
-                        darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-200'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between">
-                        <span className="font-semibold">
-                          {selectedPlatform === 'android'
-                            ? 'Notification Policy Access Granted'
-                            : selectedPlatform === 'ios'
-                              ? 'Apple Shortcut "QuietPulse DND" Installed'
-                              : 'Windows Registry/WNF Helper Permitted'}
-                        </span>
-                        <input
-                          type="checkbox"
-                          checked={osDndPermissionGranted}
-                          onChange={(e) => setOsDndPermissionGranted(e.target.checked)}
-                          className="w-4 h-4 accent-emerald-500 cursor-pointer"
-                        />
-                      </div>
-                      <p className="text-slate-400 leading-relaxed">
-                        {osDndPermissionGranted
-                          ? 'Starting a session snapshots your current OS interruption filter, enables DND, and restores the prior filter when finished.'
-                          : 'When OS DND permission is off, starting a session automatically triggers the in-app Full-Screen Focus Lockout Mode.'}
-                      </p>
-                    </div>
-
-                    <div
                       className={`p-3.5 rounded-lg border text-xs font-mono space-y-1 ${
                         liveDndState.active
-                          ? 'bg-indigo-950/60 border-indigo-500/40 text-indigo-300'
+                          ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-300'
                           : darkMode
                             ? 'bg-slate-900 border-slate-800 text-slate-300'
                             : 'bg-slate-50 border-slate-200 text-slate-700'
                       }`}
                     >
-                      <div>STATE: {liveDndState.active ? 'DND_ENGAGED' : 'IDLE_NORMAL'}</div>
-                      <div>MODE: {liveDndState.mode}</div>
-                      <div className="truncate">DETAIL: {liveDndState.statusLabel}</div>
+                      <div>
+                        FIREWALL: {liveDndState.active ? 'ACTIVE_BLOCKING' : 'STANDBY_PASSTHROUGH'}
+                      </div>
+                      <div>FILTER: {interruptionFilter}</div>
+                      <div>
+                        WAKE LOCK: {wakeLockActive ? 'SCREEN_LOCKED_AWAKE' : 'STANDARD'} · BLOCKED:{' '}
+                        {interceptedVault.filter((v) => v.action === 'BLOCKED').length}
+                      </div>
+                      <div className="truncate">ADAPTER: {liveDndState.statusLabel}</div>
                     </div>
                   </div>
 
@@ -1953,75 +2817,275 @@ export default function App() {
             </div>
           )}
 
-          {/* TAB 5: CHROME ANDROID APK & WEBAPK LAUNCHER */}
+          {/* TAB 5: CHROME ANDROID APK & WEBAPK LAUNCHER + DOWNLOAD CENTER */}
           {activeTab === 'apk' && (
             <div className="space-y-8">
               <div className={`p-6 sm:p-8 rounded-xl border space-y-6 ${surfaceCardClass}`}>
                 <div className="flex flex-wrap items-start justify-between gap-4">
                   <div>
+                    <div className="text-xs font-mono text-emerald-400 mb-1">
+                      ANDROID APK LAUNCH &amp; DOWNLOAD CENTER
+                    </div>
                     <h2 className="text-xl font-bold font-display">
-                      Launch &amp; Install as Chrome Android APK (WebAPK / TWA / Native)
+                      How to Launch as an APK in Web &amp; Download to Your Device
                     </h2>
                     <p className="text-xs text-slate-400 mt-1 max-w-2xl leading-relaxed">
-                      QuietPulse is configured with a full Web App Manifest, Service Worker,
-                      maskable Android adaptive icons, Digital Asset Links (
-                      <code className="font-mono text-emerald-400">
-                        /.well-known/assetlinks.json
-                      </code>
-                      ), and Bubblewrap TWA / React Native Android APK build configs.
+                      Use the buttons below to (1) <strong>download the APK build bundle</strong>{' '}
+                      directly to your computer or phone, (2) <strong>launch the interactive Android
+                      APK simulator</strong> right inside this browser, or (3) <strong>pop out to a
+                      standalone Chrome tab</strong> to trigger Chrome’s native WebAPK installer.
                     </p>
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-3">
-                    {/* Option 1: Direct Chrome WebAPK Install */}
-                    <button
-                      onClick={async () => {
-                        if (isInstallable) {
-                          const ok = await triggerPwaInstall();
-                          if (ok) {
-                            setApkInstallFeedback(
-                              'Installed! QuietPulse WebAPK is now on your Android launcher.'
-                            );
-                          }
-                        } else {
-                          setApkInstallFeedback(
-                            'In Chrome on Android, tap the browser menu (⋮) → "Install app" or use the Launch in Chrome Android Intent button.'
-                          );
-                        }
-                      }}
-                      className="min-h-[44px] px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-2 cursor-pointer"
+                  {/* Primary Action Buttons: Direct Download + In-Web Simulator + Standalone Pop-Out */}
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    <a
+                      href="/api/apk/download-apk-builder"
+                      download="build-quietpulse-android-apk.sh"
+                      onClick={() =>
+                        setApkInstallFeedback(
+                          'Downloaded build-quietpulse-android-apk.sh! Run `bash build-quietpulse-android-apk.sh` or `npx @bubblewrap/cli build` to compile app-release-signed.apk.'
+                        )
+                      }
+                      className="min-h-[44px] px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-2 cursor-pointer whitespace-nowrap"
                     >
                       <Download className="w-4 h-4" />
-                      <span>
-                        {isInstalled
-                          ? 'Running as Installed Standalone APK'
-                          : 'Install Chrome WebAPK'}
-                      </span>
-                    </button>
+                      <span>Download APK Builder (.sh)</span>
+                    </a>
 
-                    {/* Option 2: Android Chrome Intent URI Launcher */}
                     <a
-                      href={getChromeAndroidIntentUrl()}
-                      className="min-h-[44px] px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold flex items-center gap-2"
+                      href="/api/apk/download-webapk-html"
+                      download="QuietPulse-WebAPK-Launcher.html"
+                      onClick={() =>
+                        setApkInstallFeedback(
+                          'Downloaded QuietPulse-WebAPK-Launcher.html! Open this file on any Android phone or desktop Chrome to launch QuietPulse in standalone mode.'
+                        )
+                      }
+                      className="min-h-[44px] px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold flex items-center gap-2 cursor-pointer whitespace-nowrap"
+                    >
+                      <Download className="w-4 h-4" />
+                      <span>Download Standalone WebAPK (.html)</span>
+                    </a>
+
+                    <button
+                      onClick={() => setMobileApkSimulator(!mobileApkSimulator)}
+                      className={`min-h-[44px] px-4 py-2.5 rounded-xl border text-xs font-semibold flex items-center gap-2 cursor-pointer whitespace-nowrap ${
+                        mobileApkSimulator
+                          ? 'bg-amber-500 border-amber-400 text-slate-950'
+                          : darkMode
+                            ? 'bg-slate-900 border-slate-700 text-slate-100 hover:bg-slate-800'
+                            : 'bg-slate-100 border-slate-300 text-slate-900 hover:bg-slate-200'
+                      }`}
                     >
                       <Smartphone className="w-4 h-4" />
-                      <span>Launch in Android Chrome (Intent URI)</span>
-                      <ExternalLink className="w-3.5 h-3.5" />
-                    </a>
+                      <span>
+                        {mobileApkSimulator
+                          ? 'Exit In-Web APK Simulator'
+                          : 'Launch APK Simulator in Web'}
+                      </span>
+                    </button>
                   </div>
                 </div>
 
                 {apkInstallFeedback && (
-                  <div className="p-4 rounded-xl border border-emerald-500/40 bg-emerald-950/50 text-emerald-200 text-xs">
-                    {apkInstallFeedback}
+                  <div className="p-4 rounded-xl border border-emerald-500/40 bg-emerald-950/60 text-emerald-200 text-xs flex items-center justify-between gap-4">
+                    <span>{apkInstallFeedback}</span>
+                    <button
+                      onClick={() => setApkInstallFeedback(null)}
+                      className="text-xs underline cursor-pointer shrink-0"
+                    >
+                      Dismiss
+                    </button>
                   </div>
                 )}
 
-                {isIOS && (
-                  <div className="p-4 rounded-xl border border-indigo-500/40 bg-indigo-950/50 text-indigo-200 text-xs">
-                    On iOS Safari: Tap the <strong>Share</strong> icon in the toolbar and choose{' '}
-                    <strong>Add to Home Screen</strong> to launch QuietPulse in full-screen
-                    standalone mode.
+                {/* Why Chrome Inside an Iframe Needs a Top-Level Tab + 1-Click Pop-Out */}
+                <div
+                  className={`p-5 rounded-xl border flex flex-col lg:flex-row lg:items-center justify-between gap-4 ${
+                    darkMode
+                      ? 'bg-indigo-950/40 border-indigo-500/40'
+                      : 'bg-indigo-50 border-indigo-200'
+                  }`}
+                >
+                  <div className="space-y-1 text-xs">
+                    <div className="font-bold text-sm text-indigo-400">
+                      Installing as a Real Chrome WebAPK / Desktop App
+                    </div>
+                    <p className="text-slate-300 leading-relaxed max-w-3xl">
+                      Because the AI Studio preview runs inside an embedded iframe, Chrome disables
+                      its native <strong>Install App</strong> button until you open the app in a
+                      standalone browser tab. Click <strong>Open in Standalone Chrome Tab</strong>{' '}
+                      below, then click the <strong>Install icon</strong> on the right side of
+                      Chrome’s address bar (or tap <strong>⋮ &rarr; Install app</strong> on Android
+                      Chrome).
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+                    <a
+                      href={window.location.href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="min-h-[42px] px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-2 whitespace-nowrap"
+                    >
+                      <ExternalLink className="w-4 h-4" />
+                      <span>Open in Standalone Chrome Tab</span>
+                    </a>
+
+                    <button
+                      onClick={() => {
+                        navigator.clipboard.writeText(window.location.origin);
+                        setCopiedLiveUrl(true);
+                        setTimeout(() => setCopiedLiveUrl(false), 2000);
+                      }}
+                      className="min-h-[42px] px-3.5 py-2 rounded-lg border border-slate-700 bg-slate-900 text-slate-200 text-xs font-medium flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                    >
+                      {copiedLiveUrl ? (
+                        <>
+                          <CheckCheck className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>URL Copied!</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5" />
+                          <span>Copy Phone URL</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {/* IN-WEB INTERACTIVE ANDROID 14 APK DEVICE SIMULATOR */}
+                {mobileApkSimulator && (
+                  <div className="py-4 flex flex-col items-center">
+                    <div className="w-full max-w-[400px] rounded-[38px] border-[6px] border-slate-700 bg-[#0B0F17] shadow-2xl overflow-hidden text-slate-100">
+                      {/* Android 14 Status Bar with Live DND Icon */}
+                      <div className="px-6 py-2.5 bg-[#070A10] flex items-center justify-between text-[11px] font-mono border-b border-slate-800/80">
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold">09:41</span>
+                          {activeSession && (
+                            <span className="px-1.5 py-0.5 rounded bg-indigo-600 text-white text-[10px] font-bold">
+                              DND PRIORITY
+                            </span>
+                          )}
+                        </div>
+                        <div className="w-16 h-3.5 rounded-full bg-black border border-slate-800" />
+                        <div className="flex items-center gap-1.5 text-slate-400">
+                          <span>5G</span>
+                          <span className="text-emerald-400">100%</span>
+                        </div>
+                      </div>
+
+                      {/* Android APK App Header */}
+                      <div className="p-4 border-b border-slate-800 flex items-center justify-between bg-[#0F1624]">
+                        <div>
+                          <div className="text-sm font-bold font-display">QuietPulse APK</div>
+                          <div className="text-[11px] text-emerald-400 font-mono">
+                            com.quietpulse.habitfocus · WebAPK
+                          </div>
+                        </div>
+                        <div className="text-right font-mono text-xs">
+                          <div className="font-bold">
+                            {dashboardSummary.completedToday}/{dashboardSummary.totalCount} Done
+                          </div>
+                          <div className="text-[10px] text-slate-400">
+                            {dashboardSummary.completionPct}% today
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Android APK Interactive Body */}
+                      <div className="p-4 space-y-3 max-h-[460px] overflow-y-auto">
+                        {/* Daily Motivational Quote Card inside APK Simulator */}
+                        <div className="p-3 rounded-xl border border-slate-800 bg-[#111827] space-y-1">
+                          <div className="text-[10px] font-mono text-emerald-400">
+                            Daily Quote · Day {dailyQuote.dayOfYear}
+                          </div>
+                          <div className="text-xs font-medium text-slate-200 leading-snug">
+                            “{dailyQuote.quote}”
+                          </div>
+                          <div className="text-[11px] text-slate-400">— {dailyQuote.author}</div>
+                        </div>
+
+                        {/* Quick DND Focus Banner inside APK Simulator */}
+                        <div className="p-3.5 rounded-xl bg-indigo-950/60 border border-indigo-500/40 flex items-center justify-between gap-2">
+                          <div>
+                            <div className="text-xs font-bold text-indigo-300">
+                              {activeSession
+                                ? `DND Focus Running: ${formatTimer(remainingSeconds)}`
+                                : `Auto-DND Focus (${focusDurationMin}m)`}
+                            </div>
+                            <div className="text-[11px] text-slate-400">
+                              NotificationManager.setInterruptionFilter
+                            </div>
+                          </div>
+                          {!activeSession ? (
+                            <button
+                              onClick={() => handleStartFocusSession()}
+                              className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold cursor-pointer shrink-0"
+                            >
+                              Start DND
+                            </button>
+                          ) : (
+                            <button
+                              onClick={() => handleEndFocusSession('completed')}
+                              className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white text-xs font-semibold cursor-pointer shrink-0"
+                            >
+                              Finish
+                            </button>
+                          )}
+                        </div>
+
+                        {/* Interactive Habit Check-Off List inside APK Simulator */}
+                        {visibleHabits.map((h) => {
+                          const st = habitStatsMap[h.id];
+                          const done = Boolean(st?.completedToday);
+                          return (
+                            <div
+                              key={h.id}
+                              onClick={() => handleToggleHabitCheck(h.id)}
+                              className="p-3 rounded-xl border border-slate-800 bg-[#111827] flex items-center justify-between gap-3 cursor-pointer hover:border-slate-700"
+                            >
+                              <div className="flex items-center gap-3 min-w-0">
+                                <div
+                                  className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0 border"
+                                  style={{
+                                    backgroundColor: done ? h.color : 'transparent',
+                                    borderColor: done ? h.color : '#334155',
+                                  }}
+                                >
+                                  {done ? (
+                                    <Check className="w-4 h-4 text-white" />
+                                  ) : (
+                                    renderHabitIcon(h.icon, h.color)
+                                  )}
+                                </div>
+                                <div className="min-w-0">
+                                  <div
+                                    className={`text-xs font-semibold truncate ${
+                                      done ? 'line-through opacity-70' : ''
+                                    }`}
+                                  >
+                                    {h.name}
+                                  </div>
+                                  <div className="text-[11px] text-slate-400 font-mono">
+                                    {st?.currentStreak || 0}d streak · {h.default_focus_minutes}m
+                                  </div>
+                                </div>
+                              </div>
+                              <span className="text-[11px] font-mono text-emerald-400 shrink-0">
+                                {done ? 'Checked' : 'Tap'}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      {/* Android Navigation Gesture Pill */}
+                      <div className="py-3 bg-[#070A10] border-t border-slate-800 flex justify-center">
+                        <div className="w-28 h-1 rounded-full bg-slate-600" />
+                      </div>
+                    </div>
                   </div>
                 )}
 
@@ -2033,14 +3097,25 @@ export default function App() {
                     }`}
                   >
                     <div className="font-bold text-sm text-emerald-400">
-                      Method 1: Instant Chrome WebAPK
+                      Method 1: Instant Chrome WebAPK (No SDK Required)
                     </div>
                     <p className="text-slate-400 leading-relaxed">
-                      When opened in <strong>Google Chrome on Android</strong>, Chrome automatically
-                      compiles the manifest (<code className="font-mono">display: standalone</code>)
-                      and maskable icons into a signed system <strong>WebAPK</strong> installed to
-                      your app drawer without an address bar.
+                      1. Open the live URL in <strong>Chrome on your Android phone</strong> (or pop
+                      out to a standalone Chrome tab).
+                      <br />
+                      2. Tap the Chrome menu (<strong>⋮</strong>) &rarr;{' '}
+                      <strong>Install app</strong>.
+                      <br />
+                      3. Chrome compiles a signed Android <strong>WebAPK</strong> and adds QuietPulse
+                      to your home screen and app drawer.
                     </p>
+                    <a
+                      href={getChromeAndroidIntentUrl()}
+                      className="inline-flex items-center gap-1.5 text-emerald-400 hover:underline font-semibold pt-1"
+                    >
+                      <span>Launch via Android Chrome Intent</span>
+                      <ExternalLink className="w-3.5 h-3.5" />
+                    </a>
                   </div>
 
                   <div
@@ -2049,16 +3124,15 @@ export default function App() {
                     }`}
                   >
                     <div className="font-bold text-sm text-indigo-400">
-                      Method 2: Standalone Chrome TWA .APK
+                      Method 2: Build Standalone .APK via Bubblewrap TWA
                     </div>
                     <p className="text-slate-400 leading-relaxed">
-                      Package this web app into a standalone installable{' '}
-                      <code className="font-mono">app-release-signed.apk</code> powered by Chrome’s
-                      Trusted Web Activity engine using the included{' '}
-                      <code className="font-mono">twa-manifest.json</code>:
+                      Click <strong>Download APK Builder (.sh)</strong> above to download our{' '}
+                      <code className="font-mono">twa-manifest.json</code> and compile an installable{' '}
+                      <code className="font-mono">app-release-signed.apk</code>:
                     </p>
                     <pre className="p-2.5 rounded bg-black/70 text-slate-200 font-mono text-[11px] overflow-x-auto">
-                      {`npx @bubblewrap/cli build\nadb install app-release-signed.apk`}
+                      {`bash build-quietpulse-android-apk.sh\nnpx @bubblewrap/cli build\nadb install app-release-signed.apk`}
                     </pre>
                   </div>
 
@@ -2068,7 +3142,7 @@ export default function App() {
                     }`}
                   >
                     <div className="font-bold text-sm text-amber-400">
-                      Method 3: Native Expo + DndModule APK
+                      Method 3: Native React Native + DndModule.java APK
                     </div>
                     <p className="text-slate-400 leading-relaxed">
                       Build the React Native package in <code className="font-mono">/mobile</code>{' '}
@@ -2393,8 +3467,15 @@ export default function App() {
                 'Deep Focus Session'}
             </h2>
 
-            <div className="text-7xl sm:text-8xl font-bold font-mono tabular-nums tracking-tight py-6">
+            <div className="text-7xl sm:text-8xl font-bold font-mono tabular-nums tracking-tight py-4">
               {formatTimer(remainingSeconds)}
+            </div>
+
+            <div className="p-4 rounded-xl border border-slate-800 bg-slate-900/70 max-w-md mx-auto space-y-1">
+              <p className="text-sm text-slate-200 font-medium leading-relaxed">
+                “{dailyQuote.quote}”
+              </p>
+              <p className="text-xs text-slate-400">— {dailyQuote.author}</p>
             </div>
 
             <div className="flex flex-wrap items-center justify-center gap-3">

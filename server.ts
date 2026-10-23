@@ -695,11 +695,136 @@ app.get('/api/monorepo/files', (_req, res) => {
   return res.json({ files: loaded });
 });
 
+// Direct Download 1: Self-Contained Android APK Builder Script (Bubblewrap TWA + React Native DndModule)
+app.get('/api/apk/download-apk-builder', (req, res) => {
+  const hostUrl = `${req.protocol}://${req.get('host')}`;
+  let twaManifest = '{}';
+  let dndModuleJava = '';
+  try {
+    twaManifest = fs.readFileSync(path.resolve(process.cwd(), 'twa-manifest.json'), 'utf-8');
+    dndModuleJava = fs.readFileSync(
+      path.resolve(
+        process.cwd(),
+        'mobile/android/app/src/main/java/com/quietpulse/dnd/DndModule.java'
+      ),
+      'utf-8'
+    );
+  } catch {
+    // fallback if missing
+  }
+
+  const scriptContent = `#!/usr/bin/env bash
+# ==============================================================================
+# QuietPulse Android APK Automated Builder (Chrome TWA WebAPK + Native DndModule)
+# Generated from Live App: ${hostUrl}
+# ==============================================================================
+set -e
+
+echo "Creating QuietPulse Android APK build workspace..."
+mkdir -p quietpulse-android-apk
+cd quietpulse-android-apk
+
+cat << 'EOF_TWA' > twa-manifest.json
+${twaManifest}
+EOF_TWA
+
+mkdir -p native-dnd-module
+cat << 'EOF_JAVA' > native-dnd-module/DndModule.java
+${dndModuleJava}
+EOF_JAVA
+
+echo ""
+echo "=============================================================================="
+echo "QuietPulse TWA Manifest & Native Android DND Module extracted!"
+echo "To compile the installable Android .APK (app-release-signed.apk) via Chrome TWA:"
+echo "  1. Ensure Node.js 18+, JDK 17, and Android SDK are installed."
+echo "  2. Run: npx @bubblewrap/cli build"
+echo "  3. Install to your connected Android phone: adb install app-release-signed.apk"
+echo "=============================================================================="
+`;
+
+  res.setHeader('Content-Type', 'application/x-sh; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="build-quietpulse-android-apk.sh"');
+  return res.send(scriptContent);
+});
+
+// Direct Download 2: Portable Standalone WebAPK Launcher HTML File
+app.get('/api/apk/download-webapk-html', (req, res) => {
+  const hostUrl =
+    process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
+  const htmlContent = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#0B0F17" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <title>QuietPulse — Standalone Android APK Launcher</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0B0F17;
+      color: #F8FAFC;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      text-align: center;
+    }
+    .card {
+      max-width: 460px;
+      width: 100%;
+      background: #111827;
+      border: 1px solid #1E293B;
+      border-radius: 16px;
+      padding: 32px 24px;
+    }
+    h1 { font-size: 22px; margin-bottom: 8px; }
+    p { font-size: 13px; color: #94A3B8; line-height: 1.6; margin-bottom: 20px; }
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 14px 20px;
+      border-radius: 12px;
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      margin-bottom: 12px;
+    }
+    .btn-primary { background: #10B981; color: #ffffff; }
+    .btn-secondary { background: #4F46E5; color: #ffffff; }
+    code { font-family: monospace; color: #34D399; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>QuietPulse Android WebAPK</h1>
+    <p>Tap below to launch QuietPulse in a top-level Chrome window. In Chrome (Android or Desktop), tap the <strong>Install App</strong> icon in the address bar or menu (⋮ &rarr; <strong>Install app</strong>) to install the standalone APK.</p>
+    <a class="btn btn-primary" href="${hostUrl}" target="_blank" rel="noopener noreferrer">
+      Launch QuietPulse Standalone App
+    </a>
+    <a class="btn btn-secondary" href="intent://${hostUrl.replace(/^https?:\/\//, '')}#Intent;scheme=https;package=com.android.chrome;end">
+      Open Directly in Android Chrome (Intent)
+    </a>
+    <p style="margin-top: 12px; margin-bottom: 0;">Live App URL: <code>${hostUrl}</code></p>
+  </div>
+</body>
+</html>`;
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="QuietPulse-WebAPK-Launcher.html"');
+  return res.send(htmlContent);
+});
+
 async function startServer() {
   const PORT = 3000;
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, hmr: false },
       appType: 'spa',
     });
     app.use(vite.middlewares);
